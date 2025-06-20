@@ -1,1 +1,326 @@
+# forex_agent.py
+
+# ────────────────────────────────
+# 1) DATA PIPELINE MODULE
+# ────────────────────────────────
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from ta.trend      import EMAIndicator, MACD
+from ta.momentum   import RSIIndicator, StochasticOscillator
+from ta.volatility import AverageTrueRange
+
+class DataPipeline:
+    """
+    Loads historical EUR/USD data, engineers indicators, scales features,
+    and produces sliding-window sequences for supervised forecasting and RL.
+    """
+    def __init__(self, seq_len=60, horizon=10):
+        self.seq_len  = seq_len
+        self.horizon  = horizon
+        self.cols     = [
+            'Open','High','Low','Close','Volume',
+            'EMA_20','RSI_14','STO_k','STO_d',
+            'MACD','MACD_sig','MACD_diff','ATR_14'
+        ]
+
+    def load_and_engineer(self, start, end, interval="1h"):
+        df = yf.download("EURUSD=X",
+                         start=start, end=end,
+                         interval=interval,
+                         auto_adjust=True)[self.cols[:5]].dropna()
+
+        # — Trend & momentum features —
+        df['EMA_20'] = EMAIndicator(df['Close'], window=20).ema_indicator()
+        df['RSI_14'] = RSIIndicator(df['Close'], window=14).rsi()
+        sto = StochasticOscillator(df['High'], df['Low'], df['Close'], window=14)
+        df['STO_k'] = sto.stoch()
+        df['STO_d'] = sto.stoch_signal()
+        macd = MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+        df['MACD']      = macd.macd().squeeze()
+        df['MACD_sig']  = macd.macd_signal().squeeze()
+        df['MACD_diff'] = macd.macd_diff().squeeze()
+        df['ATR_14']    = AverageTrueRange(df['High'], df['Low'], df['Close'], window=14).average_true_range()
+
+        df.dropna(inplace=True)
+        self.df_raw = df
+
+    def scale_and_sequence(self):
+        # — Scale to [0,1] so LSTM + RL train stably —
+        self.scaler = MinMaxScaler()
+        scaled = self.scaler.fit_transform(self.df_raw[self.cols])
+        data = pd.DataFrame(scaled, columns=self.cols, index=self.df_raw.index).values
+
+        # — Build sliding windows for forecasting target “Close at t+horizon” —
+        X, y = [], []
+        total = len(data)
+        last  = total - self.seq_len - self.horizon + 1
+        close_idx = self.cols.index('Close')
+
+        for i in range(last):
+            X.append(data[i : i + self.seq_len])
+            y.append(data[i + self.seq_len + self.horizon - 1, close_idx])
+
+        X, y = np.array(X), np.array(y)
+
+        # — Split into 70/15/15 train/val/test —
+        n   = len(X)
+        t0  = int(0.7 * n)
+        t1  = t0 + int(0.15 * n)
+        self.X_train, self.X_val, self.X_test = X[:t0], X[t0:t1], X[t1:]
+        self.y_train, self.y_val, self.y_test = y[:t0], y[t0:t1], y[t1:]
+
+    def prepare(self, start, end, interval="1h"):
+        self.load_and_engineer(start, end, interval)
+        self.scale_and_sequence()
+        return (self.X_train, self.y_train,
+                self.X_val,   self.y_val,
+                self.X_test,  self.y_test,
+                self.scaler,  self.df_raw.index[
+                    self.seq_len + self.horizon - 1 + int(0.85 * len(self.X_train))
+                :])
+
+
+
+# ────────────────────────────────
+# 2) FORECAST + ACTOR-CRITIC MODEL MODULE
+# ────────────────────────────────
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.optimizers import Adam
+
+class ActorCriticForecast(Model):
+    """
+    Single Keras model with:
+      • a Bi-LSTM base to extract temporal features
+      • a regression head ("forecast") predicting future price
+      • an actor head (policy) over {Sell, Hold, Buy}
+      • a critic head (state‐value) for advantage estimation
+    """
+    def __init__(self, seq_len, n_features, n_actions=3, lr=1e-4):
+        super().__init__()
+        # — Shared Bi-LSTM backbone —
+        self.bi_lstm1 = layers.Bidirectional(layers.LSTM(128, return_sequences=True))
+        self.drop1    = layers.Dropout(0.2)
+        self.bi_lstm2 = layers.Bidirectional(layers.LSTM(64))
+        self.drop2    = layers.Dropout(0.2)
+
+        # — Forecast head (supervised MSE) —
+        self.forecast_dense = layers.Dense(1, activation='linear')
+
+        # — Actor head (softmax policy) —
+        self.actor_dense = layers.Dense(32, activation='relu')
+        self.logits      = layers.Dense(n_actions, activation=None)
+
+        # — Critic head (value) —
+        self.critic_dense = layers.Dense(32, activation='relu')
+        self.value        = layers.Dense(1, activation='linear')
+
+        self.compile(optimizer=Adam(learning_rate=lr))
+
+    def call(self, inputs):
+        x = self.bi_lstm1(inputs)
+        x = self.drop1(x)
+        x = self.bi_lstm2(x)
+        x = self.drop2(x)
+
+        # Forecast
+        forecast = self.forecast_dense(x)
+
+        # Policy
+        a_hidden = self.actor_dense(x)
+        logits   = self.logits(a_hidden)
+
+        # Value
+        v_hidden = self.critic_dense(x)
+        value    = self.value(v_hidden)
+
+        return forecast, logits, value
+
+
+
+# ────────────────────────────────
+# 3) GYM ENVIRONMENT MODULE
+# ────────────────────────────────
+import gym
+from gym import spaces
+
+class ForexTradingEnv(gym.Env):
+    """
+    OpenAI-Gym style environment wrapping our price series.
+    State = last seq_len × n_features slice.
+    Action = {0: SELL, 1: HOLD, 2: BUY}.
+    Reward = P&L over next horizon − transaction cost.
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, data_pipeline, commission=1e-4):
+        super().__init__()
+        # load pre-processed arrays
+        self.X_test      = data_pipeline.X_test
+        self.y_test      = data_pipeline.y_test
+        self.seq_len     = data_pipeline.seq_len
+        self.horizon     = data_pipeline.horizon
+        self.n_steps     = len(self.X_test)
+        self.current_idx = 0
+        self.commission  = commission
+
+        # Gym spaces
+        n_features = self.X_test.shape[2]
+        self.observation_space = spaces.Box(
+            low=0, high=1,
+            shape=(self.seq_len, n_features),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(3)
+
+    def reset(self):
+        self.current_idx = 0
+        self.position    = 0   # −1 short, 0 flat, +1 long
+        return self.X_test[0]
+
+    def step(self, action):
+        # 1) Compute P&L over the next horizon
+        true_price = self.y_test[self.current_idx]
+        prev_price = self.X_test[self.current_idx, -1, self.observation_space.shape[1] -  (1 + data_pipeline.cols[::-1].index('Close'))]  # last Close
+        pnl        = (true_price - prev_price) * (action - 1)  # action-1 => −1,0,+1
+        pnl       -= abs(action - self.position) * self.commission
+        self.position = action - 1
+
+        reward = pnl
+        self.current_idx += 1
+        done = (self.current_idx >= self.n_steps - 1)
+        obs  = self.X_test[self.current_idx] if not done else np.zeros_like(self.X_test[0])
+        return obs, reward, done, {}
+
+    def render(self, mode='human'):
+        pass
+
+
+
+# ────────────────────────────────
+# 4) RL TRAINER MODULE
+# ────────────────────────────────
+class RLTrainer:
+    """
+    Orchestrates:
+      1) Pre-training the forecast head (supervised MSE)
+      2) Policy‐gradient (A2C/PPO) training of the actor + critic using the Gym env
+    """
+    def __init__(self, model: ActorCriticForecast, env: ForexTradingEnv):
+        self.model = model
+        self.env   = env
+
+    def pretrain_forecast(self, X, y, X_val, y_val, epochs=50, batch_size=64):
+        """Train just the forecast head with MSE loss before RL."""
+        mse = tf.keras.losses.MeanSquaredError()
+        self.model.compile(optimizer=self.model.optimizer, loss=mse)
+        self.model.fit(
+            X, y,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=2
+        )
+
+    def train_actor_critic(self, episodes=1000, gamma=0.99):
+        """
+        A simple A2C loop:
+         • Collect rollout
+         • Compute advantages
+         • Apply policy & value updates
+        """
+        opt = self.model.optimizer
+        for ep in range(episodes):
+            # 1) Generate one episode
+            states, actions, rewards, values, dones = [], [], [], [], []
+            obs = self.env.reset()
+            done = False
+            while not done:
+                # forward pass
+                forecast, logits, value = self.model(obs[None, ...])
+                action = tf.random.categorical(logits, 1)[0,0].numpy()
+                next_obs, reward, done, _ = self.env.step(action)
+
+                # store
+                states.append(obs)
+                actions.append(action)
+                rewards.append(reward)
+                values.append(value[0,0].numpy())
+                dones.append(done)
+
+                obs = next_obs
+
+            # 2) Compute returns & advantages
+            returns, advs = self._compute_advantages(rewards, values, gamma)
+
+            # 3) Update policy & value networks
+            with tf.GradientTape() as tape:
+                # forward all states
+                _, all_logits, all_values = self.model(np.array(states))
+                # policy loss (categorical crossentropy weighted by advantage)
+                pg_loss = tf.reduce_mean(
+                    tf.nn.sparse_softmax_cross_entropy_with_logits(
+                        labels=np.array(actions), logits=all_logits
+                    ) * advs
+                )
+                # value loss (MSE between returns and predicted value)
+                v_loss  = tf.reduce_mean((returns - tf.squeeze(all_values))**2)
+                loss    = pg_loss + 0.5 * v_loss  # combine
+
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            opt.apply_gradients(zip(grads, self.model.trainable_variables))
+
+            if ep % 50 == 0:
+                print(f"Episode {ep:4d}  |  Total Reward: {sum(rewards): .3f}")
+
+    def _compute_advantages(self, rewards, values, gamma):
+        """
+        Compute discounted returns and advantages:
+          returns[t] = sum_{k=0…} gamma^k * rewards[t+k]
+          adv[t]     = returns[t] - values[t]
+        """
+        returns = []
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+        returns = np.array(returns)
+        advs    = returns - np.array(values)
+        return returns, advs
+
+
+
+# ────────────────────────────────
+# 5) MAIN EXECUTION
+# ────────────────────────────────
+if __name__ == "__main__":
+    # 1) Prepare data
+    dp = DataPipeline(seq_len=60, horizon=10)
+    X_tr, y_tr, X_val, y_val, X_ts, y_ts, scaler, test_idx = dp.prepare(
+        start="2023-06-17", end="2025-06-17", interval="1h"
+    )
+
+    # 2) Build model
+    model = ActorCriticForecast(seq_len=60, n_features=len(dp.cols))
+
+    # 3) Pretrain forecasting head
+    trainer = RLTrainer(model, None)  # env injected later
+    trainer.pretrain_forecast(X_tr, y_tr, X_val, y_val)
+
+    # 4) Wrap environment
+    env = ForexTradingEnv(dp, commission=1e-4)
+
+    # 5) Train actor-critic
+    trainer.env = env
+    trainer.train_actor_critic(episodes=2000, gamma=0.99)
+
+    # 6) Evaluate & export
+    metrics = {
+        **model.evaluate(X_ts, y_ts),
+        **{"directional_accuracy": model.evaluate_directional(X_ts, y_ts)}
+    }
+    print("Final Backtest Metrics:", metrics)
+    model.save_weights("forex_rl_agent.h5")
 
